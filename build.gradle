@@ -277,6 +277,12 @@ project('test:integration') {
         compile files(project(':client').sourceSets.test.output)
     }
 
+    test {
+        onlyIf {
+            project.hasProperty("integrationTests")
+        }
+    }
+
     task startServer(type: JavaExec) {
         main = "io.pravega.segmentstore.server.host.ServiceStarter"
         classpath = sourceSets.main.runtimeClasspath
