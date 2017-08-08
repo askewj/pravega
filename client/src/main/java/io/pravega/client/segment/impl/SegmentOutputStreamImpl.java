@@ -78,9 +78,8 @@ class SegmentOutputStreamImpl implements SegmentOutputStream {
     private final State state = new State();
     private final ResponseProcessor responseProcessor = new ResponseProcessor();
     private final RetryWithBackoff retrySchedule;
-    private final Object connectionEstablishmentLock = new Object();
     private final Object writeOrderLock = new Object();
-    
+
     /**
      * Internal object that tracks the state of the connection.
      * All mutations of data occur inside of this class. All operations are protected by the lock object.
@@ -389,7 +388,7 @@ class SegmentOutputStreamImpl implements SegmentOutputStream {
             }
         }
     }
-    
+
     /**
      * Establish a connection and wait for it to be setup. (Retries built in)
      */
@@ -399,8 +398,40 @@ class SegmentOutputStreamImpl implements SegmentOutputStream {
             throw new SegmentSealedException(this.segmentName);
         }
         CompletableFuture<ClientConnection> future =  new CompletableFuture<>();
-        state.setupConnection.runReleaserAndAwait(this::reconnect, future);
+        state.setupConnection.runReleaserAndAwait(this::initiateConnectionSetup, future);
         return future;
+    }
+
+    private void initiateConnectionSetup() {
+        Retry.indefinitelyWithExpBackoff(retrySchedule.getInitialMillis(), retrySchedule.getMultiplier(),
+                retrySchedule.getMaxDelay(),
+                t -> log.warn(writerId + " Failed to connect: ", t))
+                .runAsync(() -> {
+                    if (state.isClosed() || state.isAlreadySealed()) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    Preconditions.checkState(state.getConnection() == null);
+                    log.info("Fetching endpoint for segment {}", segmentName);
+                    return controller.getEndpointForSegment(segmentName).thenCompose((PravegaNodeUri uri) -> {
+                        log.info("Establishing connection to {} for {}", uri, segmentName);
+                        return connectionFactory.establishConnection(uri, responseProcessor);
+                    }).thenCompose(connection -> {
+                        CompletableFuture<Void> connectionSetupFuture = state.newConnection(connection);
+                        SetupAppend cmd = new SetupAppend(requestIdGenerator.get(), writerId, segmentName);
+                        try {
+                            connection.send(cmd);
+                        } catch (ConnectionFailedException e1) {
+                            throw Lombok.sneakyThrow(e1);
+                        }
+                        return connectionSetupFuture.exceptionally(t -> {
+                            if (ExceptionHelpers.getRealException(t) instanceof SegmentSealedException) {
+                                log.info("Ending reconnect attempts to {} because segment is sealed", segmentName);
+                                return null;
+                            }
+                            throw Lombok.sneakyThrow(t);
+                        });
+                    });
+                }, connectionFactory.getInternalExecutor());
     }
     
     /**
@@ -447,37 +478,7 @@ class SegmentOutputStreamImpl implements SegmentOutputStream {
     
     @VisibleForTesting
     void reconnect() {
-        state.setupConnection.runReleaserAndAwait(() -> {
-            Retry.indefinitelyWithExpBackoff(retrySchedule.getInitialMillis(), retrySchedule.getMultiplier(),
-                                             retrySchedule.getMaxDelay(),
-                                             t -> log.warn(writerId + " Failed to connect: ", t))
-                 .runAsync(() -> {
-                     if (state.isClosed() || state.isAlreadySealed()) {
-                         return CompletableFuture.completedFuture(null);
-                     }
-                     Preconditions.checkState(state.getConnection() == null);
-                     log.info("Fetching endpoint for segment {}", segmentName);
-                     return controller.getEndpointForSegment(segmentName).thenCompose((PravegaNodeUri uri) -> {
-                         log.info("Establishing connection to {} for {}", uri, segmentName);
-                         return connectionFactory.establishConnection(uri, responseProcessor);
-                     }).thenCompose(connection -> {
-                         CompletableFuture<Void> connectionSetupFuture = state.newConnection(connection);
-                         SetupAppend cmd = new SetupAppend(requestIdGenerator.get(), writerId, segmentName);
-                         try {
-                             connection.send(cmd);
-                         } catch (ConnectionFailedException e1) {
-                             throw Lombok.sneakyThrow(e1);
-                         }
-                         return connectionSetupFuture.exceptionally(t -> {
-                             if (ExceptionHelpers.getRealException(t) instanceof SegmentSealedException) {
-                                 log.info("Ending reconnect attempts to {} because segment is sealed", segmentName);
-                                 return null;
-                             }
-                             throw Lombok.sneakyThrow(t);
-                         });
-                     });
-                 }, connectionFactory.getInternalExecutor());
-        }, new CompletableFuture<ClientConnection>());
+        state.setupConnection.runReleaserAndAwait(this::initiateConnectionSetup, new CompletableFuture<ClientConnection>());
     }
 
 
